@@ -1,0 +1,775 @@
+#!/usr/bin/env bash
+#
+# git-change-branch-name
+#
+# Rename a local branch and update the same branch on the remote.
+#
+# Default behaviour (no mode flags):
+#   - Rename the local branch
+#   - Push the new name and set it as upstream
+#   - Delete the old name on the remote
+#
+# A failed later step can be finished by running the command again.
+# Commits are not rewritten.
+#
+# WARNING: This is destructive when not in dry-run.
+#          Anyone tracking the old remote name must update their checkout.
+#
+
+VERSION="0.0.0"
+
+REMOTE_NAME="origin"
+REMOTE_EXPLICIT="false"
+OLD_NAME=""
+NEW_NAME=""
+OLD_EXPLICIT="false"
+NEW_EXPLICIT="false"
+OLD_FROM_CURRENT="false"
+GIT_DIR=""
+WORK_TREE=""
+
+DRY_RUN="false"
+ASSUME_YES="false"
+LOCAL_ONLY="false"
+SUMMARY_ONLY="false"
+PUSH_REMOTE="false"
+REMOTE_URL=""
+POSITIONALS=()
+
+OLD_EXISTS="false"
+NEW_EXISTS="false"
+UNBORN="false"
+LOCAL_SHA=""
+REMOTE_OLD_SHA=""
+REMOTE_NEW_SHA=""
+UPSTREAM_TARGET=""
+
+DO_PUBLISH="false"
+DO_DELETE="false"
+DO_RENAME="false"
+ALREADY_DONE="false"
+
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_BOLD=""
+COLOR_RESET=""
+
+STEP_CURRENT=0
+STEP_TOTAL=0
+STEP_LABEL=""
+
+GIT_CMD=(git)
+
+init_colors()
+{
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+    then
+        COLOR_RED=$'\033[31m'
+        COLOR_GREEN=$'\033[32m'
+        COLOR_YELLOW=$'\033[33m'
+        COLOR_CYAN=$'\033[36m'
+        COLOR_BOLD=$'\033[1m'
+        COLOR_RESET=$'\033[0m'
+    fi
+}
+
+usage()
+{
+    cat <<EOF
+${COLOR_BOLD}Usage:${COLOR_RESET} $0 [options] <new-name>
+       $0 [options] <old-name> <new-name>
+
+Rename a local branch, then publish the new name and delete the old remote name.
+
+Names:
+  -o, --old-name NAME      Branch to rename (default: the current branch)
+  -N, --new-name NAME      New branch name
+
+Remote:
+  -r, --remote NAME        Remote to update (default: ${REMOTE_NAME})
+  -L, --local-only         Rename locally and do not touch the remote
+
+Safety:
+  -n, --dry-run            Show what would be done, but don't change anything
+                           (commands are simulated)
+  -S, --summary            Print a detailed action plan based on all flags and exit.
+                           No rename, no prompts, no changes.
+  -y, --yes                Assume 'RENAME' confirmation (non-interactive / CI mode)
+  -f, --force              Same as --yes
+
+Paths:
+  -d, --git-dir PATH       Path to the repository .git directory
+  -w, --work-tree PATH     Path to the working tree
+                           Pass both together when the repo is not the current directory.
+
+  -V, --version            Print version and exit
+  -h, --help               Show this help and exit
+
+One positional argument renames the current branch. Two positional arguments
+rename <old-name> to <new-name>.
+EOF
+}
+
+error()
+{
+    echo "${COLOR_RED}ERROR:${COLOR_RESET} $*" >&2
+    exit 1
+}
+
+require_arg()
+{
+    if [ -z "${2:-}" ]
+    then
+        error "${1} requires an argument."
+    fi
+}
+
+prepare_git()
+{
+    GIT_CMD=(git)
+    if [ -n "${GIT_DIR}" ]
+    then
+        GIT_CMD+=(--git-dir "${GIT_DIR}")
+    fi
+    if [ -n "${WORK_TREE}" ]
+    then
+        GIT_CMD+=(--work-tree "${WORK_TREE}")
+    fi
+}
+
+parse_args()
+{
+    POSITIONALS=()
+
+    while [ "$#" -gt 0 ]
+    do
+        case "$1" in
+            -o|--old-name)
+                require_arg "$1" "${2:-}"
+                OLD_NAME="$2"
+                OLD_EXPLICIT="true"
+                shift 2
+                ;;
+            -N|--new-name)
+                require_arg "$1" "${2:-}"
+                NEW_NAME="$2"
+                NEW_EXPLICIT="true"
+                shift 2
+                ;;
+            -r|--remote)
+                require_arg "$1" "${2:-}"
+                REMOTE_NAME="$2"
+                REMOTE_EXPLICIT="true"
+                shift 2
+                ;;
+            -d|--git-dir)
+                require_arg "$1" "${2:-}"
+                GIT_DIR="$2"
+                shift 2
+                ;;
+            -w|--work-tree)
+                require_arg "$1" "${2:-}"
+                WORK_TREE="$2"
+                shift 2
+                ;;
+            -L|--local-only)
+                LOCAL_ONLY="true"
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            -S|--summary)
+                SUMMARY_ONLY="true"
+                shift
+                ;;
+            -y|--yes|-f|--force)
+                ASSUME_YES="true"
+                shift
+                ;;
+            -v|-V|--version)
+                echo "git-change-branch-name ${VERSION}"
+                exit 0
+                ;;
+            -h|--help|-\?)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                POSITIONALS+=("$@")
+                break
+                ;;
+            -*)
+                echo "${COLOR_RED}ERROR:${COLOR_RESET} Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                POSITIONALS+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [ -n "${GIT_DIR}" ] && [ -z "${WORK_TREE}" ]
+    then
+        error "--git-dir must be used with --work-tree."
+    fi
+    if [ -n "${WORK_TREE}" ] && [ -z "${GIT_DIR}" ]
+    then
+        error "--work-tree must be used with --git-dir."
+    fi
+    if [ "${LOCAL_ONLY}" = "true" ] && [ "${REMOTE_EXPLICIT}" = "true" ]
+    then
+        error "Cannot use --local-only and --remote together."
+    fi
+}
+
+resolve_names()
+{
+    local count="${#POSITIONALS[@]}"
+    local current
+
+    if [ "${OLD_EXPLICIT}" = "true" ] && [ "${NEW_EXPLICIT}" = "true" ]
+    then
+        if [ "${count}" -ne 0 ]
+        then
+            error "Do not pass branch names as arguments when --old-name and --new-name are set."
+        fi
+    elif [ "${NEW_EXPLICIT}" = "true" ]
+    then
+        if [ "${count}" -eq 0 ]
+        then
+            OLD_FROM_CURRENT="true"
+        elif [ "${count}" -eq 1 ]
+        then
+            OLD_NAME="${POSITIONALS[0]}"
+        else
+            error "Too many arguments."
+        fi
+    elif [ "${OLD_EXPLICIT}" = "true" ]
+    then
+        if [ "${count}" -eq 1 ]
+        then
+            NEW_NAME="${POSITIONALS[0]}"
+        else
+            usage
+            error "--old-name requires the new branch name."
+        fi
+    else
+        if [ "${count}" -eq 1 ]
+        then
+            NEW_NAME="${POSITIONALS[0]}"
+            OLD_FROM_CURRENT="true"
+        elif [ "${count}" -eq 2 ]
+        then
+            OLD_NAME="${POSITIONALS[0]}"
+            NEW_NAME="${POSITIONALS[1]}"
+        else
+            usage
+            error "Pass the new branch name, or the old name and the new name."
+        fi
+    fi
+
+    if [ "${OLD_FROM_CURRENT}" = "true" ]
+    then
+        current="$("${GIT_CMD[@]}" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        if [ -z "${current}" ]
+        then
+            error "HEAD is detached. Pass the old branch name."
+        fi
+        OLD_NAME="${current}"
+    fi
+
+    if [ -z "${OLD_NAME}" ] || [ -z "${NEW_NAME}" ]
+    then
+        usage
+        error "Both the old branch name and the new branch name are required."
+    fi
+    if [ "${OLD_NAME}" = "${NEW_NAME}" ]
+    then
+        error "The old and new branch names are the same."
+    fi
+
+    validate_branch_name "${OLD_NAME}"
+    validate_branch_name "${NEW_NAME}"
+}
+
+validate_branch_name()
+{
+    local name="$1"
+    local normalized
+
+    if ! normalized="$(git check-ref-format --branch "${name}" 2>/dev/null)"
+    then
+        error "Invalid branch name: ${name}"
+    fi
+    if [ "${normalized}" != "${name}" ]
+    then
+        error "Invalid branch name: ${name}"
+    fi
+}
+
+require_repo()
+{
+    prepare_git
+    if ! "${GIT_CMD[@]}" rev-parse --is-inside-work-tree >/dev/null 2>&1
+    then
+        error "This does not appear to be a Git repository."
+    fi
+}
+
+branch_exists()
+{
+    "${GIT_CMD[@]}" show-ref --verify --quiet "refs/heads/$1"
+}
+
+branch_sha()
+{
+    "${GIT_CMD[@]}" rev-parse "refs/heads/$1"
+}
+
+resolve_remote()
+{
+    local remotes
+
+    PUSH_REMOTE="false"
+    REMOTE_URL=""
+
+    if [ "${LOCAL_ONLY}" = "true" ]
+    then
+        return 0
+    fi
+
+    remotes="$("${GIT_CMD[@]}" remote 2>/dev/null || true)"
+    if [ -z "${remotes}" ]
+    then
+        if [ "${REMOTE_EXPLICIT}" = "true" ]
+        then
+            error "Remote '${REMOTE_NAME}' does not exist in this repository."
+        fi
+        return 0
+    fi
+
+    if ! REMOTE_URL="$("${GIT_CMD[@]}" config --get "remote.${REMOTE_NAME}.url" 2>/dev/null)"
+    then
+        error "Remote '${REMOTE_NAME}' does not exist in this repository."
+    fi
+    if [ -z "${REMOTE_URL}" ]
+    then
+        error "Remote '${REMOTE_NAME}' does not exist in this repository."
+    fi
+    PUSH_REMOTE="true"
+}
+
+remote_head_sha()
+{
+    local want="refs/heads/$1"
+    local sha ref
+
+    while IFS="$(printf '\t')" read -r sha ref
+    do
+        if [ "${ref}" = "${want}" ]
+        then
+            printf '%s\n' "${sha}"
+            return 0
+        fi
+    done <<< "${REMOTE_HEADS}"
+    return 0
+}
+
+load_remote_heads()
+{
+    if ! REMOTE_HEADS="$("${GIT_CMD[@]}" ls-remote --heads "${REMOTE_NAME}")"
+    then
+        error "Failed to list branches on remote '${REMOTE_NAME}'."
+    fi
+}
+
+upstream_of()
+{
+    local name="$1"
+    local target
+
+    target="$("${GIT_CMD[@]}" rev-parse --abbrev-ref "${name}@{upstream}" 2>/dev/null || true)"
+    if [ "${target}" = "@{upstream}" ]
+    then
+        target=""
+    fi
+    printf '%s\n' "${target}"
+}
+
+inspect_state()
+{
+    local local_branch desired
+
+    OLD_EXISTS="false"
+    NEW_EXISTS="false"
+    UNBORN="false"
+    LOCAL_SHA=""
+    REMOTE_OLD_SHA=""
+    REMOTE_NEW_SHA=""
+    UPSTREAM_TARGET=""
+    DO_PUBLISH="false"
+    DO_DELETE="false"
+    DO_RENAME="false"
+    ALREADY_DONE="false"
+
+    if branch_exists "${OLD_NAME}"
+    then
+        OLD_EXISTS="true"
+    fi
+    if branch_exists "${NEW_NAME}"
+    then
+        NEW_EXISTS="true"
+    fi
+
+    if [ "${OLD_EXISTS}" = "true" ] && [ "${NEW_EXISTS}" = "true" ]
+    then
+        error "Branch '${NEW_NAME}' already exists locally."
+    fi
+
+    if [ "${OLD_EXISTS}" = "false" ] && [ "${NEW_EXISTS}" = "false" ]
+    then
+        local_branch="$("${GIT_CMD[@]}" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        if [ "${local_branch}" = "${OLD_NAME}" ]
+        then
+            UNBORN="true"
+        else
+            error "Branch '${OLD_NAME}' does not exist locally."
+        fi
+    fi
+
+    if [ "${UNBORN}" = "true" ]
+    then
+        local_branch="${OLD_NAME}"
+    elif [ "${OLD_EXISTS}" = "true" ]
+    then
+        local_branch="${OLD_NAME}"
+        LOCAL_SHA="$(branch_sha "${OLD_NAME}")"
+    else
+        local_branch="${NEW_NAME}"
+        LOCAL_SHA="$(branch_sha "${NEW_NAME}")"
+    fi
+
+    if [ "${UNBORN}" = "false" ]
+    then
+        UPSTREAM_TARGET="$(upstream_of "${local_branch}")"
+    fi
+
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        if [ "${UNBORN}" = "true" ]
+        then
+            error "Branch '${OLD_NAME}' has no commits to publish. Use --local-only to rename it locally."
+        fi
+        load_remote_heads
+        REMOTE_OLD_SHA="$(remote_head_sha "${OLD_NAME}")"
+        REMOTE_NEW_SHA="$(remote_head_sha "${NEW_NAME}")"
+        if [ -n "${REMOTE_NEW_SHA}" ] && [ "${REMOTE_NEW_SHA}" != "${LOCAL_SHA}" ]
+        then
+            error "Branch '${NEW_NAME}' already exists on remote '${REMOTE_NAME}' and points at a different commit."
+        fi
+    fi
+
+    if [ "${OLD_EXISTS}" = "true" ] || [ "${UNBORN}" = "true" ]
+    then
+        DO_RENAME="true"
+    fi
+
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        desired="${REMOTE_NAME}/${NEW_NAME}"
+        if [ -z "${REMOTE_NEW_SHA}" ] || [ "${UPSTREAM_TARGET}" != "${desired}" ]
+        then
+            DO_PUBLISH="true"
+        fi
+        if [ -n "${REMOTE_OLD_SHA}" ]
+        then
+            DO_DELETE="true"
+        fi
+    fi
+
+    if [ "${DO_PUBLISH}" = "false" ] && [ "${DO_DELETE}" = "false" ] && [ "${DO_RENAME}" = "false" ]
+    then
+        ALREADY_DONE="true"
+    fi
+}
+
+count_planned_steps()
+{
+    STEP_TOTAL=0
+    if [ "${DO_PUBLISH}" = "true" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${DO_DELETE}" = "true" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${DO_RENAME}" = "true" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${STEP_TOTAL}" -eq 0 ]
+    then
+        STEP_TOTAL=1
+    fi
+}
+
+begin_step()
+{
+    STEP_CURRENT=$((STEP_CURRENT + 1))
+    STEP_LABEL="[${STEP_CURRENT}/${STEP_TOTAL}]"
+}
+
+print_action_plan()
+{
+    echo
+    echo "${COLOR_BOLD}=== ACTION PLAN ===${COLOR_RESET}"
+    echo "Old name:         ${OLD_NAME}"
+    echo "New name:         ${NEW_NAME}"
+    if [ "${UNBORN}" = "true" ]
+    then
+        echo "Local branch:     ${OLD_NAME} (no commits yet)"
+    elif [ "${OLD_EXISTS}" = "true" ]
+    then
+        echo "Local branch:     ${OLD_NAME}"
+    else
+        echo "Local branch:     ${NEW_NAME} (already renamed)"
+    fi
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        echo "Remote:           ${REMOTE_NAME}"
+        echo "Remote URL:       ${REMOTE_URL}"
+        if [ -n "${REMOTE_NEW_SHA}" ]
+        then
+            echo "Remote new name:  already present"
+        else
+            echo "Remote new name:  will be published"
+        fi
+        if [ -n "${REMOTE_OLD_SHA}" ]
+        then
+            echo "Remote old name:  will be deleted"
+        else
+            echo "Remote old name:  not present"
+        fi
+        if [ -n "${UPSTREAM_TARGET}" ]
+        then
+            echo "Upstream now:     ${UPSTREAM_TARGET}"
+        else
+            echo "Upstream now:     (none)"
+        fi
+    else
+        echo "Remote:           (not touched)"
+    fi
+    echo "Dry-run:          ${DRY_RUN}"
+    echo "Summary-only:     ${SUMMARY_ONLY}"
+    if [ "${ALREADY_DONE}" = "true" ]
+    then
+        echo
+        echo "Actions:          none (already renamed)"
+    fi
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}No commands have been executed because --summary was used.${COLOR_RESET}"
+    fi
+}
+
+confirm()
+{
+    local answer
+
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}${COLOR_YELLOW}DRY-RUN:${COLOR_RESET} No changes will be made. Commands will be simulated."
+        echo
+        return
+    fi
+
+    echo
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        echo " ${COLOR_RED}DANGER:${COLOR_RESET} This will rename the branch and delete the old remote name."
+    else
+        echo " ${COLOR_RED}DANGER:${COLOR_RESET} This will rename the local branch."
+    fi
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo
+
+    if [ "${ASSUME_YES}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}--yes supplied, proceeding without interactive confirmation.${COLOR_RESET}"
+        return
+    fi
+
+    if ! read -r -p "Type 'RENAME' to continue, or anything else to abort: " answer
+    then
+        echo
+        error "No confirmation received. Pass --yes to run non-interactively."
+    fi
+    if [ "${answer}" != "RENAME" ]
+    then
+        echo "Aborted."
+        exit 1
+    fi
+}
+
+run()
+{
+    local desc
+    desc="$1"
+    shift
+
+    echo
+    if [ -n "${STEP_LABEL}" ]
+    then
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL} ${desc}${COLOR_RESET}"
+    else
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${desc}${COLOR_RESET}"
+    fi
+    echo "    $*"
+
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+        return 0
+    fi
+
+    if ! "$@"
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} ${desc} failed. Aborting." >&2
+        return 1
+    fi
+}
+
+publish_branch()
+{
+    if [ "${OLD_EXISTS}" = "true" ]
+    then
+        run "Publishing '${NEW_NAME}' to '${REMOTE_NAME}' and setting upstream" \
+            "${GIT_CMD[@]}" push --set-upstream "${REMOTE_NAME}" "refs/heads/${OLD_NAME}:refs/heads/${NEW_NAME}"
+        return $?
+    fi
+
+    run "Publishing '${NEW_NAME}' to '${REMOTE_NAME}' and setting upstream" \
+        "${GIT_CMD[@]}" push --set-upstream "${REMOTE_NAME}" "${NEW_NAME}"
+}
+
+delete_remote_branch()
+{
+    run "Deleting remote branch '${OLD_NAME}' on '${REMOTE_NAME}'" \
+        "${GIT_CMD[@]}" push "${REMOTE_NAME}" --delete "${OLD_NAME}"
+}
+
+rename_local_branch()
+{
+    run "Renaming local branch '${OLD_NAME}' to '${NEW_NAME}'" \
+        "${GIT_CMD[@]}" branch -m "${OLD_NAME}" "${NEW_NAME}"
+}
+
+apply_rename()
+{
+    if [ "${DO_PUBLISH}" = "true" ]
+    then
+        begin_step
+        if ! publish_branch
+        then
+            echo "No rename steps ran after the failed publish." >&2
+            exit 1
+        fi
+    fi
+
+    if [ "${DO_DELETE}" = "true" ]
+    then
+        begin_step
+        if ! delete_remote_branch
+        then
+            if [ "${DO_RENAME}" = "true" ]
+            then
+                echo "Remote branch '${NEW_NAME}' is in place. Local branch is still '${OLD_NAME}'." >&2
+                echo "Re-run the same command to delete '${OLD_NAME}' and finish the rename." >&2
+            else
+                echo "Re-run the same command to delete remote branch '${OLD_NAME}'." >&2
+            fi
+            exit 1
+        fi
+    fi
+
+    if [ "${DO_RENAME}" = "true" ]
+    then
+        begin_step
+        if ! rename_local_branch
+        then
+            if [ "${PUSH_REMOTE}" = "true" ]
+            then
+                echo "Remote '${REMOTE_NAME}' already uses '${NEW_NAME}'. Re-run to rename the local branch." >&2
+            fi
+            exit 1
+        fi
+    fi
+}
+
+print_summary()
+{
+    echo
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}Dry-run complete. No changes were made.${COLOR_RESET}"
+        return
+    fi
+
+    if [ "${ALREADY_DONE}" = "true" ]
+    then
+        echo "${COLOR_GREEN}Nothing to do.${COLOR_RESET} Branch '${NEW_NAME}' is already in place."
+        return
+    fi
+
+    echo "${COLOR_GREEN}All done.${COLOR_RESET}"
+    echo "Old name:           ${OLD_NAME}"
+    echo "New name:           ${NEW_NAME}"
+    if [ "${PUSH_REMOTE}" = "true" ]
+    then
+        echo "Remote:             ${REMOTE_NAME} (new name published, old name removed)"
+        echo "Checkouts that tracked '${OLD_NAME}' need to fetch and use '${NEW_NAME}'."
+    else
+        echo "Remote:             not touched"
+    fi
+}
+
+main()
+{
+    init_colors
+    parse_args "$@"
+    require_repo
+    resolve_names
+    resolve_remote
+    inspect_state
+    count_planned_steps
+    print_action_plan
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        exit 0
+    fi
+
+    if [ "${ALREADY_DONE}" = "true" ]
+    then
+        print_summary
+        exit 0
+    fi
+
+    confirm
+    apply_rename
+    print_summary
+}
+
+main "$@"
