@@ -16,7 +16,7 @@
 #          Anyone tracking the old remote name must update their checkout.
 #
 
-VERSION="0.0.0"
+VERSION="0.1.0"
 
 REMOTE_NAME="origin"
 REMOTE_EXPLICIT="false"
